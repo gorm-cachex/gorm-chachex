@@ -12,7 +12,7 @@ import (
 func captureOutput(t *testing.T) (*bytes.Buffer, func()) {
 	t.Helper()
 	buf := &bytes.Buffer{}
-	prevLevel := level
+	prevLevel := GetLogLevel()
 	SetOutput(buf)
 	return buf, func() {
 		SetOutput(nil)
@@ -121,4 +121,3 @@ func TestUnit_Errorw_OutputContainsKV(t *testing.T) {
 		t.Fatalf("structured fields missing: %s", out)
 	}
 }
-

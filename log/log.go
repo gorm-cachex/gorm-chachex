@@ -60,6 +60,7 @@ func init() {
 	yellow = fmt.Sprintf("\x1b[%dm", colorYellow)
 	colorEnd = "\x1b[0m"
 }
+
 // CatchPanic 在当前 goroutine 内 recover 并打印完整栈。
 //
 // 用法：
@@ -241,24 +242,36 @@ func (l Level) Color() string {
 	}
 }
 
-var level = DebugLevel
+// levelBits 保存当前日志级别。日志读、SetLogLevel 写，故用原子避免数据竞争。
+var levelBits atomic.Int32
 
 func init() {
 	pid = os.Getpid()
+	levelBits.Store(int32(DebugLevel))
 }
 
 func SetLogLevel(l Level) {
-	level = l
+	levelBits.Store(int32(l))
 }
 
-// GetLogLevel 返回当前日志级别（测试用）。
+// GetLogLevel 返回当前日志级别。
 func GetLogLevel() Level {
-	return level
+	return Level(levelBits.Load())
 }
 
 var pid = 0
-var formatTimeSec uint32
-var formatTimeSecStr string
+
+// timeCache 把"秒级时间戳 -> 格式化字符串"一起原子替换，
+// 既保留每秒只 Format 一次的快路径，又消除并发读写的数据竞争。
+type timeCache struct {
+	sec uint32
+	str string
+}
+
+var formatTimeCache atomic.Pointer[timeCache]
+
+// bufPool 复用 formatLog 的 bytes.Buffer，降低每条日志的分配。
+var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 var (
 	outputMu sync.RWMutex
@@ -282,38 +295,59 @@ func currentOutput() io.Writer {
 	return output
 }
 
-
 func formatTime(t time.Time) string {
 	sec := uint32(t.Unix())
-	pre := formatTimeSec
-	preStr := formatTimeSecStr
-	if pre == sec {
-		// 受并行优化的影响，小概率取了旧值，因为是打LOG，就不搞这么严谨了
-		return preStr
+	if c := formatTimeCache.Load(); c != nil && c.sec == sec {
+		return c.str
 	}
-	x := t.Format("01-02T15:04:05")
-	formatTimeSec = sec
-	formatTimeSecStr = x
-	return x
+	str := t.Format("01-02T15:04:05")
+	formatTimeCache.Store(&timeCache{sec: sec, str: str})
+	return str
+}
+
+// writeInt 把整数以十进制追加到 buf，避免 fmt.Sprintf 的分配。
+func writeInt(b *bytes.Buffer, n int64) {
+	var tmp [20]byte
+	b.Write(strconv.AppendInt(tmp[:0], n, 10))
 }
 
 func formatLog(l Level, buf string, callerSkip int) string {
+	return formatLogReq(l, GetReqId(), buf, callerSkip)
+}
+
+// formatLogReq 与 formatLog 一致，但由调用方直接提供 reqId，
+// 使 context 路径无需再走 goid.Get()+map 查询。
+func formatLogReq(l Level, reqId string, buf string, callerSkip int) string {
 	now := time.Now()
 
-	var b bytes.Buffer
+	b := bufPool.Get().(*bytes.Buffer)
+	b.Reset()
+	defer bufPool.Put(b)
+
 	routineId := goid.Get()
-	// 获取请求ID
-	reqId := GetReqId()
 
 	// 进程、协程、请求ID
+	b.WriteByte('(')
+	writeInt(b, int64(pid))
+	b.WriteByte(',')
+	writeInt(b, routineId)
+	b.WriteByte(')')
 	if reqId != "" {
-		b.WriteString(fmt.Sprintf("(%d,%d) [%s] ", pid, routineId, reqId))
-	} else {
-		b.WriteString(fmt.Sprintf("(%d,%d) ", pid, routineId))
+		b.WriteString(" [")
+		b.WriteString(reqId)
+		b.WriteByte(']')
 	}
+	b.WriteByte(' ')
+
 	// 时间
 	b.WriteString(formatTime(now))
-	b.WriteString(fmt.Sprintf(".%04d ", now.Nanosecond()/100000))
+	frac := now.Nanosecond() / 100000 // 0..9999
+	b.WriteByte('.')
+	b.WriteByte(byte('0' + frac/1000%10))
+	b.WriteByte(byte('0' + frac/100%10))
+	b.WriteByte(byte('0' + frac/10%10))
+	b.WriteByte(byte('0' + frac%10))
+	b.WriteByte(' ')
 
 	// 日志级别
 	b.WriteString(l.Color())
@@ -331,15 +365,16 @@ func formatLog(l Level, buf string, callerSkip int) string {
 	// 调用位置
 	filePath, fileFunc := getPackageName(callerName)
 	b.WriteString(path.Join(filePath, path.Base(callerFile)))
-	b.WriteString(":")
-	b.WriteString(fmt.Sprintf("%d:", callerLine))
+	b.WriteByte(':')
+	writeInt(b, int64(callerLine))
+	b.WriteByte(':')
 	b.WriteString(fileFunc)
 	b.WriteString(colorEnd)
-	b.WriteString(" ")
+	b.WriteByte(' ')
 
 	// 文本内容
 	b.WriteString(buf)
-	b.WriteString("\n")
+	b.WriteByte('\n')
 
 	return b.String()
 }
@@ -368,7 +403,7 @@ func PrintStack(skip int) {
 }
 
 func logIt(l Level, msg string) {
-	if l < level {
+	if l < GetLogLevel() {
 		return
 	}
 
@@ -379,10 +414,20 @@ func logIt(l Level, msg string) {
 // logItSkip 与 logIt 行为一致，但允许调用方显式指定 caller skip。
 // 主要供 *w 系列结构化日志函数使用，因为它们的调用栈比旧 API 浅一层。
 func logItSkip(l Level, msg string, skip int) {
-	if l < level {
+	if l < GetLogLevel() {
 		return
 	}
 	msg = formatLog(l, msg, skip)
+	fmt.Fprint(currentOutput(), msg)
+}
+
+// logItSkipReq 与 logItSkip 一致，但由调用方直接提供 reqId（供 context API 使用），
+// 避免再走一次 goid.Get()+map 查询。
+func logItSkipReq(l Level, reqId, msg string, skip int) {
+	if l < GetLogLevel() {
+		return
+	}
+	msg = formatLogReq(l, reqId, msg, skip)
 	fmt.Fprint(currentOutput(), msg)
 }
 
@@ -395,14 +440,20 @@ func afterLog(l Level) {
 	}
 }
 
-func logItFmt(l Level, template string, args ...interface{}) {
+// sprintfTemplate 复刻旧 logItFmt 的消息构造语义：
+// 空模板 + 有参数 → Sprint；非空模板 + 有参数 → Sprintf；否则原样返回模板。
+func sprintfTemplate(template string, args ...interface{}) string {
 	msg := template
 	if msg == "" && len(args) > 0 {
 		msg = fmt.Sprint(args...)
 	} else if msg != "" && len(args) > 0 {
 		msg = fmt.Sprintf(template, args...)
 	}
-	logIt(l, msg)
+	return msg
+}
+
+func logItFmt(l Level, template string, args ...interface{}) {
+	logIt(l, sprintfTemplate(template, args...))
 	afterLog(l)
 }
 
@@ -434,7 +485,7 @@ func Info(args ...interface{}) {
 
 func Debug(args ...interface{}) {
 	// fast check
-	if DebugLevel < level {
+	if DebugLevel < GetLogLevel() {
 		return
 	}
 	logItArgs(DebugLevel, args...)
@@ -442,7 +493,7 @@ func Debug(args ...interface{}) {
 
 func Debugf(template string, args ...interface{}) {
 	// fast check
-	if DebugLevel < level {
+	if DebugLevel < GetLogLevel() {
 		return
 	}
 	logItFmt(DebugLevel, template, args...)

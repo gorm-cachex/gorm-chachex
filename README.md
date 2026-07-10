@@ -227,6 +227,26 @@ _, _ = m.GetByPK(1)
 // → 所有内部日志自动带 [req-abc]
 ```
 
+#### GLS 隐式 vs context 显式
+
+reqId 有两条透传路径，可按场景混用（互相回退，不会丢失关联）：
+
+| 路径 | API | 原理 | 何时用 |
+|------|-----|------|--------|
+| **GLS 隐式** | `Infof/Infow/...` | 以 goid 为 key 存入全局 `sync.Map` | 深层工具函数、不方便层层传 ctx |
+| **context 显式** | `InfofCtx/InfowCtx/...` | 直接从 `ctx` 读 reqId | 手上已有 ctx（handler、gorm 回调等） |
+
+`*Ctx` 系列绕开 goid + map 查询，不受协程复用 / 漏 `ClearReqId` 影响，热路径更省：
+
+```go
+log.InfofCtx(ctx, "cost=%dms", 23)
+log.InfowCtx(ctx, "cache hit", "key", "users:pk:1", "layer", "redis")
+// ctx 内无 reqId 时自动回退当前 goroutine 的 GLS reqId
+```
+
+提供 printf 风格（`DebugfCtx/InfofCtx/WarnfCtx/ErrorfCtx`）与结构化风格
+（`DebugwCtx/InfowCtx/WarnwCtx/ErrorwCtx`）两套。
+
 ### 日志级别 / 输出
 
 ```go

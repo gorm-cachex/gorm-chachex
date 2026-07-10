@@ -228,6 +228,27 @@ _, _ = m.GetByPK(1)
 // → all internal logs are tagged [req-abc]
 ```
 
+#### Implicit GLS vs explicit context
+
+reqId can propagate via two paths, freely mixable (they fall back to each other, so nothing is lost):
+
+| Path | API | How | When |
+|------|-----|-----|------|
+| **Implicit GLS** | `Infof/Infow/...` | keyed by goid in a global `sync.Map` | deep helpers where threading ctx is awkward |
+| **Explicit context** | `InfofCtx/InfowCtx/...` | reads reqId straight from `ctx` | you already hold a ctx (handlers, gorm callbacks) |
+
+The `*Ctx` family bypasses the goid + map lookup, is immune to goroutine-id reuse /
+missed `ClearReqId`, and is cheaper on the hot path:
+
+```go
+log.InfofCtx(ctx, "cost=%dms", 23)
+log.InfowCtx(ctx, "cache hit", "key", "users:pk:1", "layer", "redis")
+// falls back to the current goroutine's GLS reqId when ctx has none
+```
+
+Both printf-style (`DebugfCtx/InfofCtx/WarnfCtx/ErrorfCtx`) and structured
+(`DebugwCtx/InfowCtx/WarnwCtx/ErrorwCtx`) variants are provided.
+
 ### Log level / output
 
 ```go
